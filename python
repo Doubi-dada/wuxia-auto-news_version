@@ -1,0 +1,169 @@
+import aiohttp
+import asyncio
+from bs4 import BeautifulSoup
+import chardet
+from datetime import datetime
+
+BASE_HOST = "https://wuxia.qq.com"
+
+DETAIL_CONCURRENCY = 10  # 详情页并发数
+
+
+# ======================
+# 动态生成文件名
+# ======================
+TODAY_STR = datetime.now().strftime("%Y%m%d")
+OUTPUT_FILE = f"天刀ol历史公告{TODAY_STR}.txt"
+
+
+# ======================
+# 基础：异步抓网页
+# ======================
+async def fetch_url(session, url):
+    async with session.get(url, ssl=False) as resp:
+        data = await resp.read()
+
+        # ① 优先使用 HTTP Header 里的 charset
+        charset = resp.charset
+        if charset:
+            try:
+                return data.decode(charset)
+            except Exception:
+                pass
+
+        # ② 尝试从 HTML meta 中判断
+        try:
+            text = data.decode("utf-8", errors="ignore")
+            if "charset=gbk" in text.lower() or "charset=\"gbk\"" in text.lower():
+                return data.decode("gbk", errors="ignore")
+            if "charset=utf-8" in text.lower():
+                return data.decode("utf-8", errors="ignore")
+        except Exception:
+            pass
+
+        # ③ chardet 作为参考
+        detected = chardet.detect(data).get("encoding")
+        if detected:
+            try:
+                return data.decode(detected)
+            except Exception:
+                pass
+
+        # ④ 最终兜底（腾讯系老站：GBK）
+        return data.decode("gbk", errors="ignore")
+
+
+
+# ======================
+# 抓公告详情（返回结构化数据）
+# ======================
+async def fetch_detail(session, sem, link):
+    async with sem:
+        url = BASE_HOST + link
+        html = await fetch_url(session, url)
+        soup = BeautifulSoup(html, "html.parser")
+
+        title_el = soup.find("h2", id="art_title")
+        pubtime_el = soup.find("div", class_="pubtime")
+        content_el = soup.find("div", class_="artws")
+
+        if not (title_el and pubtime_el and content_el):
+            return None
+
+        title = title_el.text.strip()
+        pubtime = pubtime_el.text.strip()
+        paragraphs = [p.get_text(strip=True) for p in content_el.find_all("p")]
+
+        # ✅ 这里立刻输出你抓到的公告标题
+        print(f"抓到公告：{title}")
+
+        return {
+            "title": title,
+            "pubtime": pubtime,
+            "link": url,
+            "content": paragraphs,
+        }
+
+
+# ======================
+# 解析 list 页面（顺序保证）
+# ======================
+async def parse_list_page(session, page_url):
+    html = await fetch_url(session, page_url)
+    soup = BeautifulSoup(html, "html.parser")
+
+    ul = soup.find("ul", class_="newslists")
+    if not ul:
+        return []
+
+    li_items = ul.find_all("li", class_="news-st")
+
+    # 页面内：最旧 → 最新
+    li_items.reverse()
+
+    sem = asyncio.Semaphore(DETAIL_CONCURRENCY)
+
+    tasks = []
+    for li in li_items:
+        a = li.find("a", class_="cltit")
+        if not a:
+            continue
+        link = a["href"]
+        tasks.append(fetch_detail(session, sem, link))
+
+    detail_results = await asyncio.gather(*tasks)
+
+    return [item for item in detail_results if item]
+
+
+# ======================
+# 顺序写文件（不会乱）
+# ======================
+def write_items(items):
+    with open(OUTPUT_FILE, "a", encoding="utf-8") as f:
+        for item in items:
+            f.write(f"标题: {item['title']}\n")
+            f.write(f"发布时间: {item['pubtime']}\n")
+            f.write(f"链接: {item['link']}\n")
+            f.write("公告内容:\n")
+            for p in item["content"]:
+                f.write(p + "\n")
+            f.write("-" * 50 + "\n\n")
+
+
+# ======================
+# 主流程（严格顺序）
+# ======================
+async def main():
+    timeout = aiohttp.ClientTimeout(total=20)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+
+        # -------- 历史公告（最旧 → 最新）--------
+        base_list_n = (
+            "https://wuxia.qq.com/webplat/info/news_version3/"
+            "5012/5013/5014/m3485/list_n"
+        )
+
+        for i in range(611, 615):  # 示例：607 → 608
+            print(f"\n开始抓取历史页 list_n{i}")
+            page_url = f"{base_list_n}{i}.shtml"
+            items = await parse_list_page(session, page_url)
+            write_items(items)
+
+        # -------- 最新公告（3 → 2 → 1）--------
+        latest_pages = [
+            "https://wuxia.qq.com/webplat/info/news_version3/5012/5013/5014/m3485/list_3.shtml",
+            "https://wuxia.qq.com/webplat/info/news_version3/5012/5013/5014/m3485/list_2.shtml",
+            "https://wuxia.qq.com/webplat/info/news_version3/5012/5013/5014/m3485/list_1.shtml",
+        ]
+
+        for url in latest_pages:
+            print(f"\n开始抓取最新页 {url}")
+            items = await parse_list_page(session, url)
+            write_items(items)
+
+
+# ======================
+# 启动
+# ======================
+asyncio.run(main())
